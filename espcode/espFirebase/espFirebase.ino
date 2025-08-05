@@ -6,6 +6,7 @@
 #include <FirebaseESP32.h>
 #include <WiFi.h>
 #include <time.h>
+#include <HTTPClient.h>
 
 #define RST_PIN         2
 #define SS_PIN          21
@@ -164,6 +165,7 @@ void addUID(String uid, String name) {
 }
 
 void logToFirebase(String uid, String name) {
+  sendDiscordNotification("UID: " + uid + " | Name: " + name + " | Time: " + getCurrentTime());
   String path = "/logs/" + String(millis());
   FirebaseJson json;
 
@@ -186,4 +188,26 @@ String getCurrentTime() {
   char buffer[30];
   strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buffer);
+}
+
+void sendDiscordNotification(String message) {
+  HTTPClient http;
+  String webhookUrl = "https://discord.com/api/webhooks/1369580386606387221/tlfN0ha-OPRweMG0Art3HREDREAEHkToJC5nTvmJjzEuGaZBisp310lZycZKaViJR9Ew";  // Replace with your actual webhook URL
+
+  http.begin(webhookUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{\"content\": \"" + message + "\"}";
+
+  int httpResponseCode = http.POST(payload);
+
+  if (httpResponseCode > 0) {
+    Serial.print("Discord response code: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Error sending to Discord: ");
+    Serial.println(http.errorToString(httpResponseCode).c_str());
+  }
+
+  http.end();
 }
