@@ -1,0 +1,1 @@
+partition scheme for esp32 : NO OTA(2MB APP/ 2MB SPIFFS)
