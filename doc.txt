@@ -1,1 +1,3 @@
 partition scheme for esp32 : NO OTA(2MB APP/ 2MB SPIFFS)
+Arduino IDE libraries:
+Firebase esp32 client by Mobizt
