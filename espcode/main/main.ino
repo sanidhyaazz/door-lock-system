@@ -7,6 +7,9 @@
 #include <WiFi.h>
 #include <time.h>
 #include <HTTPClient.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define RST_PIN         2
 #define SS_PIN          21
@@ -26,6 +29,38 @@ const char* jsonFilePath = "/uids.json";
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+
+// -------- Async Logging Setup --------
+struct LogEntry {
+  String uid;
+  String name;
+  String time;
+};
+
+QueueHandle_t logQueue;
+TaskHandle_t logTaskHandle;
+
+void logTaskFunction(void *param) {
+  LogEntry entry;
+  while (true) {
+    if (xQueueReceive(logQueue, &entry, portMAX_DELAY)) {
+      sendDiscordNotification(entry.name + " has entered with UID: " + entry.uid + " at Time: " + entry.time);
+      String path = "/logs/" + String(millis());
+      FirebaseJson json;
+      json.set("uid", entry.uid);
+      json.set("name", entry.name);
+      json.set("time", entry.time);
+
+      if (Firebase.setJSON(fbdo, path.c_str(), json)) {
+        Serial.println("Logged to Firebase: " + entry.time);
+      } else {
+        Serial.println("Firebase Error: " + fbdo.errorReason());
+      }
+    }
+  }
+}
+
+// -------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -51,7 +86,9 @@ void setup() {
       Serial.println("Created empty UID file.");
     }
   }
+
   addUID("4E 12 31 03", "Sanidhya Jain");
+  addUID("A3 DB 59 FB", "Shivam Gupta");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
@@ -74,7 +111,7 @@ void setup() {
   Firebase.reconnectWiFi(true);
 
   // NTP Config (IST = UTC+5:30)
-  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");  // 19800 = 5.5 hrs offset in seconds
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Waiting for NTP time sync");
   while (time(nullptr) < 100000) {
@@ -83,10 +120,26 @@ void setup() {
   }
   Serial.println(" Time synced.");
 
+  // Create queue to hold logs
+  logQueue = xQueueCreate(10, sizeof(LogEntry));
+  if (logQueue == NULL) {
+    Serial.println("Failed to create log queue");
+    return;
+  }
+
+  // Start the background logging task
+  xTaskCreatePinnedToCore(
+    logTaskFunction,    // Task function
+    "LogTask",          // Task name
+    8192,               // Stack size
+    NULL,               // Parameter
+    1,                  // Priority
+    &logTaskHandle,     // Handle
+    1                   // Core 1
+  );
 }
 
 void loop() {
-  // Look for new cards
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
     return;
 
@@ -97,13 +150,17 @@ void loop() {
   String name;
   if (checkUIDInFile(scannedUID, name)) {
     Serial.println("Access accepted: " + name);
-    logToFirebase(scannedUID, name);
   } else {
+    name = "Unknown";
     Serial.println("Access denied");
-    logToFirebase(scannedUID, "Unknown");
   }
 
-  delay(1500);  // Debounce read
+  LogEntry entry = { scannedUID, name, getCurrentTime() };
+  if (xQueueSend(logQueue, &entry, 0) != pdPASS) {
+    Serial.println("Log queue full, entry dropped.");
+  }
+
+  delay(1500);  // Debounce
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
 }
@@ -127,7 +184,6 @@ bool checkUIDInFile(String uid, String &nameOut) {
     return false;
   }
 
-  // Allocate enough buffer for JSON
   const size_t capacity = 1024;
   StaticJsonDocument<capacity> doc;
   DeserializationError error = deserializeJson(doc, file);
@@ -164,22 +220,6 @@ void addUID(String uid, String name) {
   }
 }
 
-void logToFirebase(String uid, String name) {
-  sendDiscordNotification(name + " has entered with UID: " + uid + " at Time: " + getCurrentTime());
-  String path = "/logs/" + String(millis());
-  FirebaseJson json;
-
-  json.set("uid", uid);
-  json.set("name", name);
-  json.set("time", getCurrentTime());
-
-  if (Firebase.setJSON(fbdo, path.c_str(), json)) {
-    Serial.println("Logged to Firebase: " + getCurrentTime());
-} else {
-    Serial.println("Firebase Error: " + fbdo.errorReason());
-}
-}
-
 String getCurrentTime() {
   time_t now = time(nullptr);
   struct tm timeinfo;
@@ -192,7 +232,7 @@ String getCurrentTime() {
 
 void sendDiscordNotification(String message) {
   HTTPClient http;
-  String webhookUrl = "https://discord.com/api/webhooks/1369580386606387221/tlfN0ha-OPRweMG0Art3HREDREAEHkToJC5nTvmJjzEuGaZBisp310lZycZKaViJR9Ew";  // Replace with your actual webhook URL
+  String webhookUrl = "https://discord.com/api/webhooks/1369580386606387221/tlfN0ha-OPRweMG0Art3HREDREAEHkToJC5nTvmJjzEuGaZBisp310lZycZKaViJR9Ew";
 
   http.begin(webhookUrl);
   http.addHeader("Content-Type", "application/json");
