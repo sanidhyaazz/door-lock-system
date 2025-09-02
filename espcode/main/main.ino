@@ -7,7 +7,15 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Arduino.h>
-#include <secrets.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+// #include <secret.h>
+#define WIFI_SSID "A.T.O.M_Labs"
+#define WIFI_PASSWORD "atom281121"
+#define FIREBASE_API_KEY "AIzaSyAoer09OK5EPK6oFtCjIs8FxfHUVRYppUA"
+#define FIREBASE_DB_URL "https://lab-server-5128b-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define DISCORD_WEBHOOK "https://discord.com/api/webhooks/1369580386606387221/tlfN0ha-OPRweMG0Art3HREDREAEHkToJC5nTvmJjzEuGaZBisp310lZycZKaViJR9Ew"
+
 
 
 #define RST_PIN 4
@@ -18,7 +26,30 @@
 #define doorRelay 27
 #define irSensor 33
 
+
+#define BUTTON_SELECT 32  // Button to select character
+#define BUTTON_DELETE 16  // Button to delete last character
+#define POT_PIN 34        // Potentiometer pin
+String enteredName = "";  // Store the entered name
+char currentChar = 'A';
+// Button debounce
+bool selectPressed = false;
+bool deletePressed = false;
+unsigned long lastSelectTime = 0;
+unsigned long lastDeleteTime = 0;
+const unsigned long debounceDelay = 200;
+enum MenuState { NORMAL_MODE,
+                 MENU_OPEN,
+                 ADD_UID_WAIT_CARD,
+                 NAME_ENTRY };
+MenuState menuState = NORMAL_MODE;
+
+String pendingUID = "";
+
+
 MFRC522 mfrc522(SS_PIN, RST_PIN);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled1(U8G2_R0, /* clock=*/22, /* data=*/21, /* reset=*/U8X8_PIN_NONE);  //small oled
+U8G2_SH1106_128X64_NONAME_F_SW_I2C oled2(U8G2_R0, /* clock=*/25, /* data=*/26, /* reset=*/U8X8_PIN_NONE);   //big oled
 
 const char* jsonFilePath = "/uids.json";
 const char* offlineLogPath = "/offline.json";
@@ -44,11 +75,21 @@ struct LogEntry {
 QueueHandle_t logQueue;
 
 void setup() {
+
   Serial.begin(115200);
   while (!Serial)
     ;
   pinMode(doorRelay, OUTPUT);
   pinMode(irSensor, INPUT);
+  pinMode(BUTTON_SELECT, INPUT_PULLUP);
+  pinMode(BUTTON_DELETE, INPUT_PULLUP);
+  pinMode(POT_PIN, INPUT);
+  oled1.begin();
+  oled2.begin();
+  oled1.setFont(u8g2_font_ncenB08_tr);
+  oled2.setFont(u8g2_font_ncenB08_tr);
+  oled1.clearBuffer();
+  oled2.clearBuffer();
   // Init SPI and MFRC522 - This always works offline
   SPI.begin();
   mfrc522.PCD_Init();
@@ -136,8 +177,6 @@ void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   wifidisconnect = false;
 }
 
-
-
 void setupFirebase() {
   if (!wifiConnected) return;
 
@@ -183,12 +222,6 @@ void setupNTP() {
   ntpSynced = true;
 }
 
-#include <Arduino.h>
-#include <MFRC522.h>
-
-// Assuming you already have: irSensor pin, mfrc522 object, unlockdoor(),
-// checkUIDInFile(), getUIDString(), tryOnlineLogging() implemented
-
 void handleIRSensor() {
   if (digitalRead(irSensor) == HIGH) {
     Serial.println("IR Sensor triggered, unlocking door");
@@ -205,9 +238,82 @@ void handleIRSensor() {
     }
   }
 }
+void menu() {
+  oled1.clearBuffer();
+
+  // Read potentiometer → pick option
+  int potValue = analogRead(POT_PIN);
+  int option = map(potValue, 0, 4095, 1, 2);
+
+  // Draw menu
+  oled1.drawStr(0, 12, "ADMIN MODE");
+  oled1.drawStr(0, 28, "1: ADD UID");
+  oled1.drawStr(0, 44, "2: LAB CLOSED");
+
+  // Show current option at bottom
+  char buf[20];
+  sprintf(buf, "Option: %d", option);
+  oled1.drawStr(0, 60, buf);
+
+  oled1.sendBuffer();
+
+  // --- DELETE button → exit menu ---
+  bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
+  if (deleteCurrentState && !deletePressed && millis() - lastDeleteTime > debounceDelay) {
+    Serial.println("Button B pressed");
+    deletePressed = true;
+    lastDeleteTime = millis();
+
+    menuState = NORMAL_MODE;
+    oled1.clearBuffer();
+    oled1.sendBuffer();
+    return;
+  }
+  if (!deleteCurrentState) deletePressed = false;
+
+  // --- SELECT button → confirm option ---
+  bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
+  if (selectCurrentState && !selectPressed && millis() - lastSelectTime > debounceDelay) {
+    selectPressed = true;
+    lastSelectTime = millis();
+
+    if (option == 1) {
+      // Step 1 → Wait for RFID card
+      oled1.clearBuffer();
+      oled1.drawStr(0, 30, "Scan new card...");
+      oled1.sendBuffer();
+
+      menuState = ADD_UID_WAIT_CARD;  // TaskCore0 handles transition to NAME_ENTRY
+      return;
+    }
+
+    if (option == 2) {
+      // Step 2 → Close lab
+      sendDiscordNotification("Lab is closed");
+      menuState = NORMAL_MODE;
+
+      oled1.clearBuffer();
+      oled1.drawStr(0, 30, "Lab Closed!");
+      oled1.sendBuffer();
+      delay(1000);  // small feedback pause
+      oled1.clearBuffer();
+      oled1.sendBuffer();
+      return;
+    }
+  }
+  if (!selectCurrentState) selectPressed = false;
+}
+
+
 
 void handleRFID() {
   // If no new card, skip
+  bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
+  if (selectCurrentState) {
+    delay(100);
+    menuState = MENU_OPEN;
+    return;
+  }
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
     return;
 
@@ -238,7 +344,6 @@ void handleRFID() {
   LogEntry entry = { scannedUID, name, accessGranted };
   xQueueSend(logQueue, &entry, 0);
 
-  // Cleanup card
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
 }
@@ -247,11 +352,102 @@ void TaskCore0code(void* pvParameters) {
   pinMode(irSensor, INPUT);
 
   for (;;) {
-    handleIRSensor();
-    handleRFID();
+    if (menuState == NORMAL_MODE) {
+
+      handleIRSensor();
+      handleRFID();
+    } else if (menuState == MENU_OPEN) {
+      menu();
+    } else if (menuState == ADD_UID_WAIT_CARD) {
+      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        pendingUID = getUIDString();
+        Serial.println("New card scanned: " + pendingUID);
+        menuState = NAME_ENTRY;
+        enteredName = "";  // reset name entry
+        currentChar = 'A';
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+      }
+    } else if (menuState == NAME_ENTRY) {
+      handleNameEntry();  // <-- this is your pasted code logic, moved to function
+    }
     vTaskDelay(50 / portTICK_PERIOD_MS);  // small yield for Wi-Fi system tasks
   }
 }
+
+bool bothPressed = false;
+
+void handleNameEntry() {
+  int potValue = analogRead(POT_PIN);
+  int charIndex = map(potValue, 0, 4095, 0, 26);
+  currentChar = (charIndex < 26) ? ('A' + charIndex) : ' ';
+
+  bool selectCurrentState = (digitalRead(BUTTON_SELECT) == LOW);
+  bool deleteCurrentState = (digitalRead(BUTTON_DELETE) == LOW);
+
+  // --- BOTH pressed = SAVE NAME ---
+  if (selectCurrentState && deleteCurrentState) {
+    if (!bothPressed && millis() - lastSelectTime > debounceDelay && millis() - lastDeleteTime > debounceDelay) {
+      bothPressed = true;
+      lastSelectTime = lastDeleteTime = millis();
+
+      if (enteredName.length() > 0 && pendingUID.length() > 0) {
+        Serial.println("Saving UID+Name: " + pendingUID + " => " + enteredName);
+        addUID(pendingUID, enteredName);  // save in JSON
+        enteredName = "";
+        pendingUID = "";
+        menuState = NORMAL_MODE;  // back to normal mode
+      }
+    }
+    return;
+  }
+
+  // reset once either button is released
+  if (!selectCurrentState || !deleteCurrentState) {
+    bothPressed = false;
+  }
+
+  // --- SELECT alone ---
+  if (selectCurrentState && !selectPressed && (millis() - lastSelectTime) > debounceDelay) {
+    selectPressed = true;
+    lastSelectTime = millis();
+    if (enteredName.length() < 16) enteredName += currentChar;
+  }
+  if (!selectCurrentState) selectPressed = false;
+
+  // --- DELETE alone ---
+  if (deleteCurrentState && !deletePressed && (millis() - lastDeleteTime) > debounceDelay) {
+    deletePressed = true;
+    lastDeleteTime = millis();
+    if (enteredName.length() > 0) enteredName.remove(enteredName.length() - 1);
+  }
+  if (!deleteCurrentState) deletePressed = false;
+
+  updateNameEntryDisplay();
+}
+
+
+void updateNameEntryDisplay() {
+  oled1.clearBuffer();
+
+  oled1.setCursor(0, 10);
+  oled1.print("Enter Name for UID");
+
+  oled1.setCursor(0, 25);
+  oled1.print("UID: ");
+  oled1.print(pendingUID);
+
+  oled1.setCursor(0, 40);
+  oled1.print("Name: ");
+  oled1.print(enteredName);
+
+  oled1.setCursor(0, 55);
+  oled1.print("Char: ");
+  oled1.print(currentChar);
+
+  oled1.sendBuffer();
+}
+
 
 void TaskCore1code(void* pvParameters) {
   LogEntry entry;
